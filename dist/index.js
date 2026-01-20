@@ -9,7 +9,8 @@ import { randomBytes } from "crypto";
 const APPROVALS_DIR = join(homedir(), ".clawdbot", "approvals");
 const AUDIT_LOG_PATH = join(homedir(), ".clawdbot", "approvals", "audit.jsonl");
 const DEFAULT_EXPIRY_MS = 2 * 60 * 60 * 1000; // 2 hours
-const STALE_LOCK_MS = 30000; // 30 seconds - locks older than this are considered stale
+// HIGH: Stale lock must exceed command timeout (60s) to prevent mid-execution lock theft
+const STALE_LOCK_MS = 90000; // 90 seconds - must be > command timeout (60s)
 const MAX_EXEC_BUFFER = 10 * 1024 * 1024; // 10MB buffer for command output
 // ID validation regex - only alphanumeric, no path separators (HIGH: path traversal fix)
 const VALID_ID_REGEX = /^[A-Z0-9]{4,16}$/;
@@ -401,18 +402,25 @@ function execute(id) {
             });
             throw new Error(`Approval ${id} has expired (was approved but not executed in time)`);
         }
+        // MEDIUM: Set "executing" status before running commands for crash recovery
+        approval.status = "executing";
+        saveApproval(approval);
         const results = [];
         const errors = [];
         let successCount = 0;
-        // Fix PATH concatenation (MEDIUM: guard against undefined)
+        // Platform-aware PATH handling (MEDIUM: Codex finding - Windows compatibility)
         const basePath = process.env.PATH || "";
+        const isWindows = process.platform === "win32";
+        const pathSeparator = isWindows ? ";" : ":";
+        const extraPath = isWindows ? "" : "/opt/homebrew/bin"; // macOS homebrew path
+        const newPath = extraPath ? `${extraPath}${pathSeparator}${basePath}` : basePath;
         const env = {
             ...process.env,
-            PATH: `/opt/homebrew/bin:${basePath}`,
+            PATH: newPath,
             ...approval.env,
         };
         // Detect shell (MEDIUM: portable shell)
-        const shell = process.platform === "win32" ? "cmd.exe" : (process.env.SHELL || "/bin/sh");
+        const shell = isWindows ? "cmd.exe" : (process.env.SHELL || "/bin/sh");
         for (const cmd of approval.commands) {
             try {
                 const output = execSync(cmd, {
@@ -515,17 +523,25 @@ function approveAndExecute(id, actor) {
             channel: approval.channel,
         });
         // Execute immediately (still under same lock)
+        // MEDIUM: Set "executing" status before running commands for crash recovery
+        approval.status = "executing";
+        saveApproval(approval);
         const results = [];
         const errors = [];
         let successCount = 0;
+        // Platform-aware PATH handling (MEDIUM: Codex finding - Windows compatibility)
         const basePath = process.env.PATH || "";
+        const isWindows = process.platform === "win32";
+        const pathSeparator = isWindows ? ";" : ":";
+        const extraPath = isWindows ? "" : "/opt/homebrew/bin";
+        const newPath = extraPath ? `${extraPath}${pathSeparator}${basePath}` : basePath;
         const env = {
             ...process.env,
-            PATH: `/opt/homebrew/bin:${basePath}`,
+            PATH: newPath,
             ...approval.env,
         };
         // Detect shell (MEDIUM: portable shell)
-        const shell = process.platform === "win32" ? "cmd.exe" : (process.env.SHELL || "/bin/sh");
+        const shell = isWindows ? "cmd.exe" : (process.env.SHELL || "/bin/sh");
         for (const cmd of approval.commands) {
             try {
                 const output = execSync(cmd, {

@@ -9,7 +9,7 @@ interface Approval {
     channel?: string;
     chatId?: string;
     proposedBy?: string;
-    status: "pending" | "approved" | "denied" | "executed" | "expired" | "failed" | "partial";
+    status: "pending" | "approved" | "denied" | "executing" | "executed" | "expired" | "failed" | "partial";
     approvedAt?: string;
     approvedBy?: string;
     deniedAt?: string;
