@@ -704,6 +704,16 @@ function getStats() {
         recentActivity: readAuditLog(20),
     };
 }
+// MEDIUM: Sanitize strings before terminal output to prevent ANSI escape injection
+function sanitizeForTerminal(str) {
+    if (!str)
+        return str;
+    // Remove ANSI escape sequences and control characters (except newline/tab)
+    return str
+        .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "") // ANSI escape sequences
+        .replace(/\x1b\][^\x07]*\x07/g, "") // OSC sequences
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ""); // Control chars (keep \t \n \r)
+}
 function formatRelativeTime(date) {
     const now = new Date();
     const diffMs = date.getTime() - now.getTime();
@@ -723,20 +733,21 @@ function formatApproval(a, verbose = false) {
     const expiry = new Date(a.expiresAt);
     const relTime = formatRelativeTime(expiry);
     const expiryStr = a.status === "pending" ? ` (${relTime} left)` : "";
-    let out = `[${a.id}] ${a.status.toUpperCase()}${expiryStr}\n  ${a.summary}`;
+    // Sanitize untrusted fields before terminal output
+    let out = `[${a.id}] ${a.status.toUpperCase()}${expiryStr}\n  ${sanitizeForTerminal(a.summary)}`;
     if (verbose) {
         if (a.details)
-            out += `\n  Details: ${a.details}`;
+            out += `\n  Details: ${sanitizeForTerminal(a.details)}`;
         if (a.channel)
             out += `\n  Channel: ${a.channel}${a.chatId ? ` (${a.chatId})` : ""}`;
         out += `\n  Commands:`;
         for (const cmd of a.commands) {
-            out += `\n    $ ${cmd}`;
+            out += `\n    $ ${sanitizeForTerminal(cmd)}`;
         }
         if (a.result)
-            out += `\n  Result: ${a.result.substring(0, 200)}...`;
+            out += `\n  Result: ${sanitizeForTerminal(a.result.substring(0, 200))}...`;
         if (a.error)
-            out += `\n  Error: ${a.error.substring(0, 200)}...`;
+            out += `\n  Error: ${sanitizeForTerminal(a.error.substring(0, 200))}...`;
     }
     return out;
 }

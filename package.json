@@ -1,6 +1,6 @@
 {
   "name": "clawdbot-approvals",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Clawdbot plugin for action approvals - propose, review, and execute actions safely",
   "main": "dist/index.js",
   "type": "module",
