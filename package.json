@@ -1,0 +1,29 @@
+{
+  "name": "clawdbot-approvals",
+  "version": "1.0.0",
+  "description": "Clawdbot plugin for action approvals - propose, review, and execute actions safely",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "clawdbot",
+    "plugin",
+    "approvals",
+    "safety",
+    "automation"
+  ],
+  "author": "Jonathan Haas",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "clawdbot": {
+    "extensions": [
+      "dist/index.js"
+    ]
+  }
+}

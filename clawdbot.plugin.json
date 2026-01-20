@@ -1,0 +1,17 @@
+{
+  "id": "approvals",
+  "name": "Approvals",
+  "description": "Action approval system - propose, review, and execute actions safely",
+  "version": "1.0.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "defaultExpiryMinutes": {
+        "type": "number",
+        "description": "Default expiry time for approvals in minutes",
+        "default": 120
+      }
+    }
+  }
+}
