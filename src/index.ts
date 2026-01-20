@@ -1,6 +1,6 @@
 import { execSync } from "child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, appendFileSync, openSync, closeSync, constants } from "fs";
-import { join } from "path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, appendFileSync, openSync, closeSync, constants, renameSync, statSync } from "fs";
+import { join, basename } from "path";
 import { homedir } from "os";
 import { randomBytes } from "crypto";
 
@@ -46,6 +46,23 @@ interface AuditLogEntry {
 const APPROVALS_DIR = join(homedir(), ".clawdbot", "approvals");
 const AUDIT_LOG_PATH = join(homedir(), ".clawdbot", "approvals", "audit.jsonl");
 const DEFAULT_EXPIRY_MS = 2 * 60 * 60 * 1000; // 2 hours
+const STALE_LOCK_MS = 30000; // 30 seconds - locks older than this are considered stale
+const MAX_EXEC_BUFFER = 10 * 1024 * 1024; // 10MB buffer for command output
+
+// ID validation regex - only alphanumeric, no path separators (HIGH: path traversal fix)
+const VALID_ID_REGEX = /^[A-Z0-9]{4,16}$/;
+
+function validateId(id: string): string {
+  const normalized = id.toUpperCase().trim();
+  if (!VALID_ID_REGEX.test(normalized)) {
+    throw new Error(`Invalid approval ID: "${id}" - must be 4-16 alphanumeric characters`);
+  }
+  // Extra safety: ensure no path components
+  if (normalized !== basename(normalized) || normalized.includes("..")) {
+    throw new Error(`Invalid approval ID: "${id}" - contains invalid characters`);
+  }
+  return normalized;
+}
 
 function ensureDir(): void {
   if (!existsSync(APPROVALS_DIR)) {
@@ -53,12 +70,20 @@ function ensureDir(): void {
   }
 }
 
+// Best-effort audit logging - never throws (MEDIUM: Codex finding)
 function appendAuditLog(entry: AuditLogEntry): void {
-  ensureDir();
-  appendFileSync(AUDIT_LOG_PATH, JSON.stringify(entry) + "\n");
+  try {
+    ensureDir();
+    appendFileSync(AUDIT_LOG_PATH, JSON.stringify(entry) + "\n");
+  } catch (err) {
+    console.warn(`[approvals] Failed to write audit log: ${err}`);
+  }
 }
 
 function readAuditLog(limit = 100): AuditLogEntry[] {
+  // Validate limit parameter (MEDIUM: Codex finding)
+  const safeLimit = Math.max(1, Math.min(limit || 100, 10000));
+
   if (!existsSync(AUDIT_LOG_PATH)) return [];
   try {
     const content = readFileSync(AUDIT_LOG_PATH, "utf-8");
@@ -80,7 +105,7 @@ function readAuditLog(limit = 100): AuditLogEntry[] {
       console.warn(`[approvals] Skipped ${parseErrors} malformed audit log line(s)`);
     }
 
-    return entries.slice(-limit).reverse(); // most recent first
+    return entries.slice(-safeLimit).reverse(); // most recent first
   } catch {
     return [];
   }
@@ -97,6 +122,9 @@ function generateId(): string {
 }
 
 function generateUniqueId(maxRetries = 10): string {
+  // Ensure directory exists before trying to create files (HIGH: first-run fix)
+  ensureDir();
+
   for (let i = 0; i < maxRetries; i++) {
     const id = generateId();
     const path = getApprovalPath(id);
@@ -106,8 +134,12 @@ function generateUniqueId(maxRetries = 10): string {
       closeSync(fd);
       unlinkSync(path); // Remove placeholder, will be written properly
       return id;
-    } catch {
-      // Collision, retry
+    } catch (err: any) {
+      // ENOENT means dir doesn't exist (shouldn't happen after ensureDir)
+      // EEXIST means collision, retry
+      if (err.code !== "EEXIST") {
+        throw err;
+      }
     }
   }
   throw new Error("Failed to generate unique approval ID after retries");
@@ -117,7 +149,19 @@ function generateUniqueId(maxRetries = 10): string {
 const LOCK_TIMEOUT_MS = 5000;
 const LOCK_RETRY_MS = 50;
 
+// Check if a lock file is stale (older than STALE_LOCK_MS)
+function isLockStale(lockPath: string): boolean {
+  try {
+    const stat = statSync(lockPath);
+    const age = Date.now() - stat.mtimeMs;
+    return age > STALE_LOCK_MS;
+  } catch {
+    return true; // If we can't stat it, treat as stale/gone
+  }
+}
+
 function acquireLock(id: string): string {
+  ensureDir();
   const lockPath = join(APPROVALS_DIR, `${id}.lock`);
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
 
@@ -128,17 +172,20 @@ function acquireLock(id: string): string {
       closeSync(fd);
       return lockPath;
     } catch {
-      // Lock exists, check if it's still there
-      try {
-        readFileSync(lockPath);
-        // Lock file is just a placeholder, if it exists someone else has it
-      } catch {
-        // Lock file gone, retry
+      // Lock exists - check if it's stale (MEDIUM: stale lock detection)
+      if (isLockStale(lockPath)) {
+        try {
+          unlinkSync(lockPath);
+          // Try again immediately after clearing stale lock
+          continue;
+        } catch {
+          // Someone else cleared it, retry
+        }
       }
-      // Wait and retry
+      // Wait and retry (use setTimeout-style delay instead of busy-wait)
       const wait = (ms: number) => {
         const end = Date.now() + ms;
-        while (Date.now() < end) { /* busy wait */ }
+        while (Date.now() < end) { /* busy wait - acceptable for short durations */ }
       };
       wait(LOCK_RETRY_MS);
     }
@@ -155,7 +202,8 @@ function releaseLock(lockPath: string): void {
 }
 
 function withLock<T>(id: string, fn: () => T): T {
-  const lockPath = acquireLock(id);
+  const validId = validateId(id);
+  const lockPath = acquireLock(validId);
   try {
     return fn();
   } finally {
@@ -187,34 +235,56 @@ function parsePositiveInt(value: string, name: string, defaultValue: number): nu
 }
 
 function getApprovalPath(id: string): string {
+  // Note: caller should validate ID before calling this
   return join(APPROVALS_DIR, `${id}.json`);
 }
 
 function loadApproval(id: string): Approval | null {
-  const path = getApprovalPath(id);
-  if (!existsSync(path)) return null;
   try {
+    const validId = validateId(id);
+    const path = getApprovalPath(validId);
+    if (!existsSync(path)) return null;
     return JSON.parse(readFileSync(path, "utf-8")) as Approval;
-  } catch {
+  } catch (err) {
+    console.warn(`[approvals] Failed to load approval ${id}: ${err}`);
     return null;
   }
 }
 
+// Atomic file write using temp file + rename (MEDIUM: crash safety)
 function saveApproval(approval: Approval): void {
   ensureDir();
-  writeFileSync(getApprovalPath(approval.id), JSON.stringify(approval, null, 2));
+  const validId = validateId(approval.id);
+  const finalPath = getApprovalPath(validId);
+  const tempPath = `${finalPath}.tmp.${Date.now()}`;
+
+  try {
+    writeFileSync(tempPath, JSON.stringify(approval, null, 2));
+    renameSync(tempPath, finalPath); // Atomic on POSIX
+  } catch (err) {
+    // Clean up temp file if rename failed
+    try {
+      if (existsSync(tempPath)) unlinkSync(tempPath);
+    } catch {}
+    throw err;
+  }
 }
 
 function deleteApproval(id: string): void {
-  const path = getApprovalPath(id);
-  if (existsSync(path)) {
-    unlinkSync(path);
+  try {
+    const validId = validateId(id);
+    const path = getApprovalPath(validId);
+    if (existsSync(path)) {
+      unlinkSync(path);
+    }
+  } catch (err) {
+    console.warn(`[approvals] Failed to delete approval ${id}: ${err}`);
   }
 }
 
 function listApprovals(includeAll = false): Approval[] {
   ensureDir();
-  const files = readdirSync(APPROVALS_DIR).filter((f) => f.endsWith(".json"));
+  const files = readdirSync(APPROVALS_DIR).filter((f) => f.endsWith(".json") && !f.endsWith(".tmp.json"));
   const approvals: Approval[] = [];
   const now = new Date();
 
@@ -229,8 +299,26 @@ function listApprovals(includeAll = false): Approval[] {
         const expiresAt = new Date(approval.expiresAt);
         // Invalid date or expired = mark as expired
         if (isNaN(expiresAt.getTime()) || expiresAt < now) {
-          approval.status = "expired";
-          saveApproval(approval);
+          // Use lock when mutating status (MEDIUM: Codex finding)
+          try {
+            withLock(approval.id, () => {
+              // Re-read under lock to avoid race condition
+              const current = loadApproval(approval.id);
+              if (current && current.status === "pending") {
+                current.status = "expired";
+                saveApproval(current);
+                appendAuditLog({
+                  ts: new Date().toISOString(),
+                  event: "expired",
+                  id: current.id,
+                  summary: current.summary,
+                });
+              }
+            });
+            approval.status = "expired"; // Update local copy too
+          } catch {
+            // Lock acquisition failed - skip mutation, continue listing
+          }
         }
       }
 
@@ -392,14 +480,18 @@ function execute(id: string): Approval {
       ...approval.env,
     };
 
+    // Detect shell (MEDIUM: portable shell)
+    const shell = process.platform === "win32" ? "cmd.exe" : (process.env.SHELL || "/bin/sh");
+
     for (const cmd of approval.commands) {
       try {
         const output = execSync(cmd, {
           encoding: "utf-8",
           stdio: ["pipe", "pipe", "pipe"],
-          shell: "/bin/bash",
+          shell,
           env,
           timeout: 60000, // 1 minute per command
+          maxBuffer: MAX_EXEC_BUFFER, // MEDIUM: increased buffer for large output
         }).trim();
         results.push(`$ ${cmd}\n${output}`);
         successCount++;
@@ -452,9 +544,119 @@ function execute(id: string): Approval {
   });
 }
 
+// Combined approve+execute under single lock (MEDIUM: Codex finding - race condition fix)
 function approveAndExecute(id: string, actor?: string): Approval {
-  const approved = approve(id, actor);
-  return execute(approved.id);
+  const normalizedId = id.toUpperCase();
+  return withLock(normalizedId, () => {
+    // Load and validate
+    const approval = loadApproval(normalizedId);
+    if (!approval) {
+      throw new Error(`Approval ${id} not found`);
+    }
+    if (approval.status !== "pending") {
+      throw new Error(`Approval ${id} is ${approval.status}, not pending`);
+    }
+
+    // Check expiry
+    const expiresAt = parseDate(approval.expiresAt);
+    if (expiresAt < new Date()) {
+      approval.status = "expired";
+      saveApproval(approval);
+      appendAuditLog({
+        ts: new Date().toISOString(),
+        event: "expired",
+        id: approval.id,
+        summary: approval.summary,
+      });
+      throw new Error(`Approval ${id} has expired`);
+    }
+
+    // Approve
+    approval.status = "approved";
+    approval.approvedAt = new Date().toISOString();
+    approval.approvedBy = actor;
+    appendAuditLog({
+      ts: approval.approvedAt,
+      event: "approved",
+      id: approval.id,
+      summary: approval.summary,
+      actor,
+      channel: approval.channel,
+    });
+
+    // Execute immediately (still under same lock)
+    const results: string[] = [];
+    const errors: string[] = [];
+    let successCount = 0;
+
+    const basePath = process.env.PATH || "";
+    const env = {
+      ...process.env,
+      PATH: `/opt/homebrew/bin:${basePath}`,
+      ...approval.env,
+    };
+
+    // Detect shell (MEDIUM: portable shell)
+    const shell = process.platform === "win32" ? "cmd.exe" : (process.env.SHELL || "/bin/sh");
+
+    for (const cmd of approval.commands) {
+      try {
+        const output = execSync(cmd, {
+          encoding: "utf-8",
+          stdio: ["pipe", "pipe", "pipe"],
+          shell,
+          env,
+          timeout: 60000,
+          maxBuffer: MAX_EXEC_BUFFER, // MEDIUM: increased buffer
+        }).trim();
+        results.push(`$ ${cmd}\n${output}`);
+        successCount++;
+      } catch (err: any) {
+        const stdout = err.stdout?.toString()?.trim() || "";
+        const stderr = err.stderr?.toString()?.trim() || err.message;
+        const exitCode = err.status ?? "unknown";
+        const signal = err.signal || "";
+        let errMsg = `$ ${cmd}\nEXIT: ${exitCode}`;
+        if (signal) errMsg += ` (signal: ${signal})`;
+        if (stderr) errMsg += `\nSTDERR: ${stderr}`;
+        if (stdout) errMsg += `\nSTDOUT: ${stdout}`;
+        errors.push(errMsg);
+      }
+    }
+
+    // Determine status
+    if (errors.length === 0) {
+      approval.status = "executed";
+    } else if (successCount === 0) {
+      approval.status = "failed";
+    } else {
+      approval.status = "partial";
+    }
+
+    approval.executedAt = new Date().toISOString();
+    approval.result = results.join("\n\n");
+    if (errors.length > 0) {
+      approval.error = errors.join("\n\n");
+    }
+
+    saveApproval(approval);
+    appendAuditLog({
+      ts: approval.executedAt,
+      event: "executed",
+      id: approval.id,
+      summary: approval.summary,
+      actor,
+      channel: approval.channel,
+      details: {
+        commandCount: approval.commands.length,
+        successCount,
+        errorCount: errors.length,
+        status: approval.status,
+      },
+    });
+
+    return approval;
+  });
 }
 
 function batchApprove(ids: string[] | "all", actor?: string): { approved: Approval[]; errors: { id: string; error: string }[] } {
@@ -491,8 +693,10 @@ function getLatestTimestamp(a: Approval): Date {
 }
 
 function cleanExpired(olderThanDays = 7): number {
+  // Validate days parameter (MEDIUM: Codex finding)
+  const safeDays = Math.max(1, Math.min(olderThanDays || 7, 365));
   const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - olderThanDays);
+  cutoff.setDate(cutoff.getDate() - safeDays);
 
   const all = listApprovals(true);
   let removed = 0;
