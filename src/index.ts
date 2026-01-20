@@ -67,7 +67,8 @@ function validateId(id: string): string {
 
 function ensureDir(): void {
   if (!existsSync(APPROVALS_DIR)) {
-    mkdirSync(APPROVALS_DIR, { recursive: true });
+    // MEDIUM: Set restrictive permissions (owner only) to protect approval data
+    mkdirSync(APPROVALS_DIR, { recursive: true, mode: 0o700 });
   }
 }
 
@@ -75,7 +76,8 @@ function ensureDir(): void {
 function appendAuditLog(entry: AuditLogEntry): void {
   try {
     ensureDir();
-    appendFileSync(AUDIT_LOG_PATH, JSON.stringify(entry) + "\n");
+    // MEDIUM: Set restrictive permissions (owner read/write only)
+    appendFileSync(AUDIT_LOG_PATH, JSON.stringify(entry) + "\n", { mode: 0o600 });
   } catch (err) {
     console.warn(`[approvals] Failed to write audit log: ${err}`);
   }
@@ -237,6 +239,26 @@ function parsePositiveInt(value: string, name: string, defaultValue: number): nu
   return parsed;
 }
 
+// MEDIUM: Validate expiry minutes to prevent indefinite or negative approvals
+const MIN_EXPIRY_MINUTES = 1;
+const MAX_EXPIRY_MINUTES = 7 * 24 * 60; // 7 days max
+
+function validateExpiryMinutes(minutes: number | undefined): number {
+  if (minutes === undefined || minutes === null) {
+    return DEFAULT_EXPIRY_MS / 60000; // Default in minutes
+  }
+  if (typeof minutes !== "number" || isNaN(minutes)) {
+    throw new Error(`Invalid expiryMinutes: must be a number`);
+  }
+  if (minutes < MIN_EXPIRY_MINUTES) {
+    throw new Error(`Invalid expiryMinutes: must be at least ${MIN_EXPIRY_MINUTES} minute`);
+  }
+  if (minutes > MAX_EXPIRY_MINUTES) {
+    throw new Error(`Invalid expiryMinutes: cannot exceed ${MAX_EXPIRY_MINUTES} minutes (7 days)`);
+  }
+  return minutes;
+}
+
 function getApprovalPath(id: string): string {
   // Note: caller should validate ID before calling this
   return join(APPROVALS_DIR, `${id}.json`);
@@ -262,7 +284,8 @@ function saveApproval(approval: Approval): void {
   const tempPath = `${finalPath}.tmp.${Date.now()}`;
 
   try {
-    writeFileSync(tempPath, JSON.stringify(approval, null, 2));
+    // MEDIUM: Set restrictive permissions (owner read/write only)
+    writeFileSync(tempPath, JSON.stringify(approval, null, 2), { mode: 0o600 });
     renameSync(tempPath, finalPath); // Atomic on POSIX
   } catch (err) {
     // Clean up temp file if rename failed
@@ -1139,9 +1162,8 @@ Example flow:
           if (!commands || commands.length === 0) {
             throw new Error("commands array is required for propose");
           }
-          const expiryMs = expiryMinutes
-            ? expiryMinutes * 60 * 1000
-            : DEFAULT_EXPIRY_MS;
+          const validExpiry = validateExpiryMinutes(expiryMinutes);
+          const expiryMs = validExpiry * 60 * 1000;
           const approval = propose(summary, commands, { details, expiryMs, channel, chatId, proposedBy: actor });
           return jsonResult({
             ok: true,
@@ -1345,7 +1367,8 @@ Example flow:
       chatId?: string;
       actor?: string;
     }) => {
-      const expiryMs = expiryMinutes ? expiryMinutes * 60 * 1000 : DEFAULT_EXPIRY_MS;
+      const validExpiry = validateExpiryMinutes(expiryMinutes);
+      const expiryMs = validExpiry * 60 * 1000;
       const approval = propose(summary, commands, { details, expiryMs, channel, chatId, proposedBy: actor });
       return {
         ok: true,
