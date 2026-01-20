@@ -81,6 +81,8 @@ function propose(summary, commands, options = {}) {
         details: options.details,
         commands,
         env: options.env,
+        channel: options.channel,
+        chatId: options.chatId,
         status: "pending",
     };
     saveApproval(approval);
@@ -157,15 +159,65 @@ function execute(id) {
     saveApproval(approval);
     return approval;
 }
+function approveAndExecute(id) {
+    const approved = approve(id);
+    return execute(approved.id);
+}
+function batchApprove(ids) {
+    const results = [];
+    const errors = [];
+    const toProcess = ids === "all"
+        ? listApprovals(false).map(a => a.id)
+        : ids;
+    for (const id of toProcess) {
+        try {
+            const result = approveAndExecute(id);
+            results.push(result);
+        }
+        catch (err) {
+            errors.push({ id, error: err.message });
+        }
+    }
+    return { approved: results, errors };
+}
+function cleanExpired(olderThanDays = 7) {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - olderThanDays);
+    const all = listApprovals(true);
+    let removed = 0;
+    for (const a of all) {
+        if (a.status !== "pending" && new Date(a.createdAt) < cutoff) {
+            deleteApproval(a.id);
+            removed++;
+        }
+    }
+    return removed;
+}
+function formatRelativeTime(date) {
+    const now = new Date();
+    const diffMs = date.getTime() - now.getTime();
+    const diffMins = Math.round(diffMs / 60000);
+    if (diffMins < 0)
+        return "expired";
+    if (diffMins < 1)
+        return "<1 min";
+    if (diffMins < 60)
+        return `${diffMins} min`;
+    const diffHours = Math.round(diffMins / 60);
+    if (diffHours === 1)
+        return "1 hour";
+    return `${diffHours} hours`;
+}
 function formatApproval(a, verbose = false) {
     const expiry = new Date(a.expiresAt);
-    const now = new Date();
-    const minsLeft = Math.round((expiry.getTime() - now.getTime()) / 60000);
-    const expiryStr = a.status === "pending" ? ` (expires in ${minsLeft}m)` : "";
+    const relTime = formatRelativeTime(expiry);
+    const expiryStr = a.status === "pending" ? ` (${relTime} left)` : "";
     let out = `[${a.id}] ${a.status.toUpperCase()}${expiryStr}\n  ${a.summary}`;
     if (verbose) {
         if (a.details)
             out += `\n  Details: ${a.details}`;
+        if (a.channel)
+            out += `\n  Channel: ${a.channel}${a.chatId ? ` (${a.chatId})` : ""}`;
         out += `\n  Commands:`;
         for (const cmd of a.commands) {
             out += `\n    $ ${cmd}`;
@@ -179,6 +231,7 @@ function formatApproval(a, verbose = false) {
 }
 function formatApprovalMessage(a) {
     const expiry = new Date(a.expiresAt);
+    const relTime = formatRelativeTime(expiry);
     const expiryTime = expiry.toLocaleTimeString("en-US", {
         hour: "numeric",
         minute: "2-digit",
@@ -187,7 +240,7 @@ function formatApprovalMessage(a) {
     if (a.details)
         msg += `\n${a.details}`;
     msg += `\n\nReply \`approve ${a.id}\` or \`deny ${a.id}\``;
-    msg += `\nExpires: ${expiryTime}`;
+    msg += `\nExpires: ${expiryTime} (${relTime})`;
     return msg;
 }
 // ============================================================================
@@ -231,19 +284,38 @@ export default function (api) {
             }
         });
         cmd
-            .command("yes <id>")
-            .description("Approve and execute an action")
-            .action((id) => {
+            .command("yes <id...>")
+            .description("Approve and execute action(s). Use 'all' to approve all pending.")
+            .action((ids) => {
             try {
-                const approved = approve(id);
-                console.log(`Approved ${approved.id}: ${approved.summary}`);
-                console.log("Executing...");
-                const executed = execute(id);
-                console.log(`Done.`);
-                if (executed.result)
-                    console.log(executed.result);
-                if (executed.error)
-                    console.error(`Errors:\n${executed.error}`);
+                if (ids.length === 1 && ids[0].toLowerCase() === "all") {
+                    const result = batchApprove("all");
+                    console.log(`Processed ${result.approved.length} approval(s)`);
+                    for (const a of result.approved) {
+                        console.log(`  ✓ ${a.id}: ${a.summary}`);
+                    }
+                    for (const e of result.errors) {
+                        console.error(`  ✗ ${e.id}: ${e.error}`);
+                    }
+                }
+                else if (ids.length > 1) {
+                    const result = batchApprove(ids);
+                    console.log(`Processed ${result.approved.length} approval(s)`);
+                    for (const a of result.approved) {
+                        console.log(`  ✓ ${a.id}: ${a.summary}`);
+                    }
+                    for (const e of result.errors) {
+                        console.error(`  ✗ ${e.id}: ${e.error}`);
+                    }
+                }
+                else {
+                    const executed = approveAndExecute(ids[0]);
+                    console.log(`✓ ${executed.id}: ${executed.summary}`);
+                    if (executed.result)
+                        console.log(executed.result);
+                    if (executed.error)
+                        console.error(`Errors:\n${executed.error}`);
+                }
             }
             catch (err) {
                 console.error(`Error: ${err.message}`);
@@ -314,25 +386,35 @@ Actions:
 - propose: Create a new approval request. User must approve before execution.
 - list: List pending approvals
 - check: Check status of a specific approval
+- approve: Mark an approval as approved (still needs execute)
+- deny: Mark an approval as denied
 - execute: Execute an approved action (only works if status is "approved")
+- approveAndExecute: Approve and execute in one call (most common)
+- batch: Approve and execute multiple approvals at once
+- clean: Remove old completed/expired approvals
 
 Example flow:
 1. Call with action="propose", summary="Archive 15 promo emails", commands=["gog gmail thread X --archive", ...]
 2. Send the returned message to the user
 3. User replies "approve ABC1"
-4. Call with action="execute", id="ABC1" to run the commands`,
+4. Call with action="approveAndExecute", id="ABC1" to approve and run the commands`,
         parameters: {
             type: "object",
             additionalProperties: false,
             properties: {
                 action: {
                     type: "string",
-                    enum: ["propose", "list", "check", "execute", "approve", "deny"],
+                    enum: ["propose", "list", "check", "execute", "approve", "deny", "approveAndExecute", "batch", "clean"],
                     description: "Action to perform",
                 },
                 id: {
                     type: "string",
-                    description: "Approval ID (for check/execute/approve/deny)",
+                    description: "Approval ID (for check/execute/approve/deny/approveAndExecute)",
+                },
+                ids: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Multiple approval IDs (for batch). Use ['all'] to approve all pending.",
                 },
                 summary: {
                     type: "string",
@@ -351,11 +433,23 @@ Example flow:
                     type: "number",
                     description: "Minutes until expiry (default: 120)",
                 },
+                channel: {
+                    type: "string",
+                    description: "Channel this approval was proposed from (for propose)",
+                },
+                chatId: {
+                    type: "string",
+                    description: "Chat ID within the channel (for propose)",
+                },
+                days: {
+                    type: "number",
+                    description: "Days of history to keep (for clean, default: 7)",
+                },
             },
             required: ["action"],
         },
         execute: async (_toolCallId, params, _signal, _onUpdate) => {
-            const { action, id, summary, details, commands, expiryMinutes } = params;
+            const { action, id, ids, summary, details, commands, expiryMinutes, channel, chatId, days } = params;
             switch (action) {
                 case "propose": {
                     if (!summary)
@@ -366,13 +460,14 @@ Example flow:
                     const expiryMs = expiryMinutes
                         ? expiryMinutes * 60 * 1000
                         : DEFAULT_EXPIRY_MS;
-                    const approval = propose(summary, commands, { details, expiryMs });
+                    const approval = propose(summary, commands, { details, expiryMs, channel, chatId });
                     return jsonResult({
                         ok: true,
                         approval: {
                             id: approval.id,
                             status: approval.status,
                             expiresAt: approval.expiresAt,
+                            expiresIn: formatRelativeTime(new Date(approval.expiresAt)),
                         },
                         message: formatApprovalMessage(approval),
                     });
@@ -387,6 +482,7 @@ Example flow:
                             summary: a.summary,
                             status: a.status,
                             expiresAt: a.expiresAt,
+                            expiresIn: formatRelativeTime(new Date(a.expiresAt)),
                         })),
                     });
                 }
@@ -404,6 +500,9 @@ Example flow:
                             summary: approval.summary,
                             status: approval.status,
                             expiresAt: approval.expiresAt,
+                            expiresIn: approval.status === "pending" ? formatRelativeTime(new Date(approval.expiresAt)) : undefined,
+                            channel: approval.channel,
+                            chatId: approval.chatId,
                             result: approval.result,
                             error: approval.error,
                         },
@@ -450,6 +549,47 @@ Example flow:
                         },
                     });
                 }
+                case "approveAndExecute": {
+                    if (!id)
+                        throw new Error("id is required for approveAndExecute");
+                    const executed = approveAndExecute(id);
+                    return jsonResult({
+                        ok: true,
+                        message: `Approved and executed ${executed.id}`,
+                        approval: {
+                            id: executed.id,
+                            status: executed.status,
+                            result: executed.result,
+                            error: executed.error,
+                        },
+                    });
+                }
+                case "batch": {
+                    if (!ids || ids.length === 0)
+                        throw new Error("ids array is required for batch");
+                    const toProcess = ids.length === 1 && ids[0].toLowerCase() === "all" ? "all" : ids;
+                    const result = batchApprove(toProcess);
+                    return jsonResult({
+                        ok: true,
+                        message: `Processed ${result.approved.length} approval(s)${result.errors.length > 0 ? `, ${result.errors.length} error(s)` : ""}`,
+                        approved: result.approved.map(a => ({
+                            id: a.id,
+                            summary: a.summary,
+                            status: a.status,
+                            result: a.result,
+                            error: a.error,
+                        })),
+                        errors: result.errors,
+                    });
+                }
+                case "clean": {
+                    const removed = cleanExpired(days ?? 7);
+                    return jsonResult({
+                        ok: true,
+                        message: `Removed ${removed} old approval(s)`,
+                        removed,
+                    });
+                }
                 default:
                     throw new Error(`Unknown action: ${action}`);
             }
@@ -482,5 +622,39 @@ Example flow:
     api.registerGatewayMethod("approvals.execute", async ({ id }) => {
         const executed = execute(id);
         return { ok: true, approval: executed };
+    });
+    api.registerGatewayMethod("approvals.approveAndExecute", async ({ id }) => {
+        const executed = approveAndExecute(id);
+        return { ok: true, approval: executed };
+    });
+    api.registerGatewayMethod("approvals.batch", async ({ ids }) => {
+        const toProcess = ids.length === 1 && ids[0].toLowerCase() === "all" ? "all" : ids;
+        const result = batchApprove(toProcess);
+        return { ok: true, ...result };
+    });
+    api.registerGatewayMethod("approvals.clean", async ({ days } = {}) => {
+        const removed = cleanExpired(days ?? 7);
+        return { ok: true, removed };
+    });
+    // -------------------------------------------------------------------------
+    // Cleanup Service (runs hourly)
+    // -------------------------------------------------------------------------
+    api.registerService({
+        id: "approvals-cleanup",
+        start: async () => {
+            // Clean up on startup
+            const removed = cleanExpired(7);
+            if (removed > 0) {
+                api.logger.info(`[approvals] cleaned ${removed} old approval(s)`);
+            }
+            // Schedule hourly cleanup
+            const interval = setInterval(() => {
+                const removed = cleanExpired(7);
+                if (removed > 0) {
+                    api.logger.info(`[approvals] cleaned ${removed} old approval(s)`);
+                }
+            }, 60 * 60 * 1000); // 1 hour
+            return () => clearInterval(interval);
+        },
     });
 }

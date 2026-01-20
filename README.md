@@ -42,8 +42,10 @@ Then restart the gateway.
 clawdbot approve list
 clawdbot approve list --all      # Include completed/expired
 
-# Approve and execute
+# Approve and execute (single or multiple)
 clawdbot approve yes <id>
+clawdbot approve yes <id1> <id2> <id3>
+clawdbot approve yes all         # Approve all pending
 
 # Deny
 clawdbot approve no <id>
@@ -60,12 +62,15 @@ clawdbot approve clean --days 7
 Clawd can use the `approvals` tool with these actions:
 
 ```
-action="propose"   Create a new approval request
-action="list"      List pending approvals
-action="check"     Check status of specific approval
-action="approve"   Mark approval as approved
-action="deny"      Mark approval as denied
-action="execute"   Execute an approved action
+action="propose"           Create a new approval request
+action="list"              List pending approvals
+action="check"             Check status of specific approval
+action="approve"           Mark approval as approved
+action="deny"              Mark approval as denied
+action="execute"           Execute an approved action
+action="approveAndExecute" Approve and execute in one call (recommended)
+action="batch"             Approve and execute multiple at once
+action="clean"             Remove old completed/expired approvals
 ```
 
 ### Example Flow
@@ -81,20 +86,36 @@ action="execute"   Execute an approved action
    Archive 37 promo emails
 
    Reply `approve A7K3` or `deny A7K3`
-   Expires: 10:15am
+   Expires: 10:15am (2 hours)
    ```
 
 3. User replies `approve A7K3`
 
 4. Clawd executes:
    ```
-   approvals(action="execute", id="A7K3")
+   approvals(action="approveAndExecute", id="A7K3")
    ```
+
+### Batch Approvals
+
+Approve multiple at once:
+```
+approvals(action="batch", ids=["A7K3", "B2X9", "C4Z1"])
+```
+
+Or approve all pending:
+```
+approvals(action="batch", ids=["all"])
+```
 
 ## Storage
 
 Approvals are stored as JSON files in `~/.clawdbot/approvals/`.
 
+A cleanup service runs hourly to remove approvals older than 7 days.
+
 ## Configuration
 
 Default expiry is 2 hours. Can be overridden per-approval with `expiryMinutes` parameter.
+
+Channel tracking is supported via `channel` and `chatId` parameters for tracing where approvals originated.
