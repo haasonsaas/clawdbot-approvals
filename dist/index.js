@@ -101,8 +101,10 @@ function generateUniqueId(maxRetries = 10) {
     throw new Error("Failed to generate unique approval ID after retries");
 }
 // File locking for concurrency protection
-const LOCK_TIMEOUT_MS = 5000;
-const LOCK_RETRY_MS = 50;
+// Note: Uses synchronous busy-wait which can block event loop (MEDIUM: Codex finding)
+// This is acceptable for this use case as operations are short-lived
+const LOCK_TIMEOUT_MS = 2000; // Reduced from 5s to minimize blocking
+const LOCK_RETRY_MS = 10; // Reduced from 50ms for faster acquisition
 // Check if a lock file is stale (older than STALE_LOCK_MS)
 function isLockStale(lockPath) {
     try {
@@ -499,10 +501,11 @@ function approveAndExecute(id, actor) {
             });
             throw new Error(`Approval ${id} has expired`);
         }
-        // Approve
+        // Approve - save status BEFORE executing (MEDIUM: Codex finding - crash consistency)
         approval.status = "approved";
         approval.approvedAt = new Date().toISOString();
         approval.approvedBy = actor;
+        saveApproval(approval); // Save approved state before execution
         appendAuditLog({
             ts: approval.approvedAt,
             event: "approved",
@@ -624,9 +627,21 @@ function cleanExpired(olderThanDays = 7) {
         // Use latest timestamp, not just createdAt (MEDIUM: Codex finding)
         const latestTs = getLatestTimestamp(a);
         if (a.status !== "pending" && latestTs < cutoff) {
-            deleteApproval(a.id);
-            cleanedIds.push(a.id);
-            removed++;
+            // Use lock to prevent race with other operations (MEDIUM: Codex finding)
+            try {
+                withLock(a.id, () => {
+                    // Re-check status under lock
+                    const current = loadApproval(a.id);
+                    if (current && current.status !== "pending") {
+                        deleteApproval(a.id);
+                        cleanedIds.push(a.id);
+                        removed++;
+                    }
+                });
+            }
+            catch {
+                // Lock acquisition failed - skip this one, will be cleaned next time
+            }
         }
     }
     if (removed > 0) {
@@ -698,6 +713,23 @@ function formatApprovalMessage(a) {
     let msg = `**Approval needed: \`${a.id}\`**\n${a.summary}`;
     if (a.details)
         msg += `\n${a.details}`;
+    // HIGH: Show env vars so approver can see what will be injected (Codex finding)
+    if (a.env && Object.keys(a.env).length > 0) {
+        msg += `\n\n**Environment:**`;
+        for (const [key, value] of Object.entries(a.env)) {
+            // Warn if overriding sensitive vars
+            const sensitive = ["PATH", "HOME", "USER", "SHELL", "LD_PRELOAD", "LD_LIBRARY_PATH"].includes(key);
+            const warning = sensitive ? " ⚠️" : "";
+            msg += `\n  ${key}=${value}${warning}`;
+        }
+    }
+    // Show commands explicitly
+    if (a.commands && a.commands.length > 0) {
+        msg += `\n\n**Commands:**`;
+        for (const cmd of a.commands) {
+            msg += `\n  $ ${cmd}`;
+        }
+    }
     msg += `\n\nReply \`approve ${a.id}\` or \`deny ${a.id}\``;
     msg += `\nExpires: ${expiryTime} (${relTime})`;
     return msg;
